@@ -1,11 +1,20 @@
+import os
 import requests
 from bs4 import BeautifulSoup
 from telegram.ext import Updater, MessageHandler, Filters, CommandHandler
-import zipfile
-import os
-import uuid
 
-TOKEN = "PUT_YOUR_TELEGRAM_BOT_TOKEN_HERE"
+
+# اقرأ التوكن من Heroku
+TOKEN = os.getenv("TOKEN")
+
+print("TOKEN FROM HEROKU:", TOKEN)  # Debug يظهر في اللوج
+
+if not TOKEN:
+    raise ValueError("❌ TOKEN not found in environment variables!")
+
+
+def start(update, context):
+    update.message.reply_text("🎬 أهلاً! ابعت اسم الفيلم وهجيبلك الترجمة.")
 
 
 def search_subdl(query):
@@ -16,52 +25,12 @@ def search_subdl(query):
     soup = BeautifulSoup(r.text, "html.parser")
 
     results = []
-
     for item in soup.select(".sub-title"):
         title = item.text.strip()
         link = "https://subdl.com" + item.find("a")["href"]
         results.append((title, link))
 
     return results
-
-
-def get_download_link(page_url):
-    headers = {"User-Agent": "Mozilla/5.0"}
-    r = requests.get(page_url, headers=headers)
-    soup = BeautifulSoup(r.text, "html.parser")
-
-    btn = soup.select_one("a#downloadButton")
-    if not btn:
-        return None
-
-    return "https://subdl.com" + btn["href"]
-
-
-def download_and_extract(url):
-    headers = {"User-Agent": "Mozilla/5.0"}
-
-    r = requests.get(url, headers=headers)
-    zip_name = f"temp_{uuid.uuid4()}.zip"
-
-    with open(zip_name, "wb") as f:
-        f.write(r.content)
-
-    with zipfile.ZipFile(zip_name, "r") as zip_ref:
-        zip_ref.extractall("subs")
-
-    os.remove(zip_name)
-
-    for file in os.listdir("subs"):
-        if file.endswith(".srt"):
-            return os.path.join("subs", file)
-
-    return None
-
-
-def start(update, context):
-    update.message.reply_text(
-        "🎬 أهلاً! أرسل اسم الفيلم أو المسلسل وسأرسل لك الترجمة SRT مباشرة."
-    )
 
 
 def handle_text(update, context):
@@ -71,34 +40,23 @@ def handle_text(update, context):
     try:
         results = search_subdl(query)
         if not results:
-            update.message.reply_text("❌ لم أجد أي ترجمة.")
+            update.message.reply_text("❌ مفيش ترجمة للاسم ده.")
             return
 
-        title, page_url = results[0]
-        update.message.reply_text(f"✔️ تم العثور على: {title}\n⏳ جاري تحميل الترجمة…")
+        title, link = results[0]
 
-        dl_link = get_download_link(page_url)
-        if not dl_link:
-            update.message.reply_text("⚠️ لم أجد رابط التنزيل.")
-            return
-
-        srt_file = download_and_extract(dl_link)
-        if not srt_file:
-            update.message.reply_text("⚠️ لم أستطع استخراج ملف SRT.")
-            return
-
-        update.message.reply_document(open(srt_file, "rb"))
-        os.remove(srt_file)
+        update.message.reply_text(
+            f"✔️ لقيت ترجمة:\n"
+            f"🎬 {title}\n"
+            f"🔗 {link}"
+        )
 
     except Exception as e:
-        print(e)
-        update.message.reply_text("⚠️ حدث خطأ أثناء تنفيذ العملية.")
+        update.message.reply_text("⚠️ حصل خطأ.")
+        print("ERROR:", e)
 
 
 def main():
-    if not os.path.exists("subs"):
-        os.mkdir("subs")
-
     updater = Updater(TOKEN, use_context=True)
     dp = updater.dispatcher
 
