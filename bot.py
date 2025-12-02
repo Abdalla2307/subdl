@@ -1,29 +1,27 @@
 import os
-import requests
+import cloudscraper
 from bs4 import BeautifulSoup
 from telegram.ext import Updater, MessageHandler, Filters, CommandHandler
 
 TOKEN = os.getenv("TOKEN")
-print("TOKEN FROM HEROKU:", TOKEN)
+print("TOKEN:", TOKEN)
 
-if not TOKEN:
-    raise ValueError("TOKEN missing!")
+scraper = cloudscraper.create_scraper()  # bypass Cloudflare
 
 
 def start(update, context):
-    update.message.reply_text("🎬 ابعت اسم الفيلم وهجيبلك الترجمة ✔️")
+    update.message.reply_text("🎬 ابعت اسم الفيلم او المسلسل وهجيبلك الترجمة 🔥")
 
 
 def search_subdl(query):
     url = f"https://subdl.com/search?query={query.replace(' ', '+')}"
-    headers = {"User-Agent": "Mozilla/5.0"}
+    html = scraper.get(url).text
 
-    r = requests.get(url, headers=headers)
-    soup = BeautifulSoup(r.text, "html.parser")
+    soup = BeautifulSoup(html, "html.parser")
 
     results = []
 
-    # العنصر الفعلي الحالي المجرب على SubDL
+    # العنصر الصحيح في SubDL
     for item in soup.select("div.col-md-10 a"):
         title = item.text.strip()
         link = "https://subdl.com" + item["href"]
@@ -37,13 +35,16 @@ def handle_text(update, context):
     update.message.reply_text("⏳ جاري البحث…")
 
     results = search_subdl(query)
+
     if not results:
         update.message.reply_text("❌ مفيش ترجمة للاسم ده.")
         return
 
     title, link = results[0]
 
-    update.message.reply_text(f"✔️ لقيت ترجمة:\n🎬 {title}\n🔗 {link}")
+    update.message.reply_text(
+        f"✔️ لقيت ترجمة:\n🎬 {title}\n🔗 {link}"
+    )
 
 
 def main():
