@@ -1,4 +1,5 @@
 import os
+import re
 import requests
 from flask import Flask, request
 
@@ -7,8 +8,19 @@ app = Flask(__name__)
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 SUBSOURCE_API_KEY = os.environ["SUBSOURCE_API_KEY"]
 
-# 1) حط الـ Base URL من Swagger (Servers)
-SUBSOURCE_BASE = os.environ.get("SUBSOURCE_BASE", "https://subsource.net")  # عدّلها حسب الدوكس
+# أهم متغير: base
+# مثال شائع: https://api.subsource.net/api/v1
+SUBSOURCE_BASE = os.environ.get("SUBSOURCE_BASE", "https://api.subsource.net/api/v1").rstrip("/")
+
+# Paths (تقدر تغيّرها من Heroku بدون تعديل الكود)
+# لو الدوكس عندك مختلف: عدّل المتغيرات دي في Config Vars
+MOVIES_SEARCH_PATH = os.environ.get("MOVIES_SEARCH_PATH", "/movies/search")
+SUBTITLES_LIST_PATH = os.environ.get("SUBTITLES_LIST_PATH", "/subtitles")
+SUBTITLE_DOWNLOAD_PATH = os.environ.get("SUBTITLE_DOWNLOAD_PATH", "/subtitles/{id}/download")
+
+# Auth header style: X_API_KEY | BEARER | API_KEY_HEADER_NAME
+AUTH_MODE = os.environ.get("AUTH_MODE", "X_API_KEY")  # الافتراضي
+API_KEY_HEADER_NAME = os.environ.get("API_KEY_HEADER_NAME", "X-API-Key")  # لو AUTH_MODE=API_KEY_HEADER_NAME
 
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
@@ -16,105 +28,159 @@ def tg_send(chat_id: int, text: str):
     requests.post(
         f"{TG_API}/sendMessage",
         json={"chat_id": chat_id, "text": text, "disable_web_page_preview": True},
-        timeout=30,
+        timeout=30
     ).raise_for_status()
 
+def _auth_headers():
+    base = {
+        "Accept": "application/json",
+        "User-Agent": "SubSourceTelegramBot/1.0",
+    }
+
+    if AUTH_MODE == "BEARER":
+        base["Authorization"] = f"Bearer {SUBSOURCE_API_KEY}"
+        return base
+
+    if AUTH_MODE == "API_KEY_HEADER_NAME":
+        base[API_KEY_HEADER_NAME] = SUBSOURCE_API_KEY
+        return base
+
+    # AUTH_MODE == "X_API_KEY" (افتراضي)
+    base["X-API-Key"] = SUBSOURCE_API_KEY
+    return base
+
 def subsource_request(method: str, path: str, params=None):
-    """
-    2) عدّل طريقة توثيق الـ API Key حسب الدوكس:
-       - لو Header: Authorization: Bearer <key> أو X-API-Key
-       - لو Query: api_key=<key>
-    """
-    url = SUBSOURCE_BASE.rstrip("/") + path
-
-    headers = {
-        # مثال شائع — عدّله حسب الدوكس
-        "Authorization": f"Bearer {SUBSOURCE_API_KEY}",
-        # أو: "X-API-Key": SUBSOURCE_API_KEY
-    }
-
-    r = requests.request(method, url, headers=headers, params=params, timeout=30)
+    url = SUBSOURCE_BASE + (path if path.startswith("/") else ("/" + path))
+    r = requests.request(method, url, headers=_auth_headers(), params=params, timeout=30)
+    # لو عايز تشوف URL في اللوجز: اطبعها
+    print(f"[SubSource] {method} {r.url} -> {r.status_code}")
     r.raise_for_status()
-    return r.json()
+    # بعض الـ APIs بترجع نص بدل JSON في download info
+    try:
+        return r.json()
+    except Exception:
+        return {"raw": r.text}
 
-def pick_lang_token(user_lang: str):
-    # حسب الموجود في SubSource نفسه (arabic/english...) زي صفحات الموقع
-    # مثال: https://subsource.net/subtitle/.../arabic/... :contentReference[oaicite:3]{index=3}
+def normalize_lang(token: str):
     m = {
-        "ar": "arabic",
-        "arabic": "arabic",
-        "en": "english",
-        "english": "english",
-        "fr": "french",
-        "es": "spanish",
-        "de": "german",
-        "it": "italian",
-        "tr": "turkish",
-        "fa": "persian",
+        "ar": "arabic", "arabic": "arabic",
+        "en": "english", "english": "english",
+        "fr": "french", "french": "french",
+        "es": "spanish", "spanish": "spanish",
+        "de": "german", "german": "german",
+        "it": "italian", "italian": "italian",
+        "tr": "turkish", "turkish": "turkish",
+        "fa": "persian", "persian": "persian",
     }
-    return m.get(user_lang.lower(), "arabic")
+    return m.get(token.lower(), "arabic")
 
-def handle_query(q: str, lang: str):
-    """
-    3) هنا بقى حط endpoints الصح من Swagger.
-       أنا حاطط "شكل" منطقي بناءً على الوظائف المذكورة (SearchMovies/GetSubtitles/Download). :contentReference[oaicite:4]{index=4}
-    """
+def parse_sub_command(text: str):
+    # /sub Tenet ar
+    # /sub The Dark Knight english
+    parts = text.strip().split()
+    if not parts or parts[0].lower() not in ["/sub", "/subtitle"]:
+        return None
 
-    # مثال: Search movies
-    # عدّل المسار والباراميترز حسب الدوكس
-    movies = subsource_request("GET", "/api/movies/search", params={"query": q})
+    if len(parts) == 1:
+        return {"query": "", "lang": "arabic", "want_download": False}
+
+    want_download = False
+    if parts[-1].lower() in ["-d", "--download"]:
+        want_download = True
+        parts = parts[:-1]
+
+    lang = "arabic"
+    if len(parts) >= 3 and re.fullmatch(r"[a-zA-Z]+", parts[-1]) and parts[-1].lower() in [
+        "ar","en","fr","es","de","it","tr","fa",
+        "arabic","english","french","spanish","german","italian","turkish","persian"
+    ]:
+        lang = normalize_lang(parts[-1])
+        q = " ".join(parts[1:-1]).strip()
+    else:
+        q = " ".join(parts[1:]).strip()
+
+    return {"query": q, "lang": lang, "want_download": want_download}
+
+def pick_first_id(obj, keys):
+    for k in keys:
+        if isinstance(obj, dict) and k in obj and obj[k] is not None:
+            return obj[k]
+    return None
+
+def ensure_list(resp):
+    # بعض الـ APIs بترجع {items:[...]} أو {results:[...]} أو list مباشرة
+    if isinstance(resp, list):
+        return resp
+    if isinstance(resp, dict):
+        for k in ["items", "results", "data"]:
+            if k in resp and isinstance(resp[k], list):
+                return resp[k]
+    return []
+
+def handle_search(query: str, lang: str):
+    # 1) Search movies
+    movies_resp = subsource_request("GET", MOVIES_SEARCH_PATH, params={"query": query})
+    movies = ensure_list(movies_resp)
     if not movies:
-        return f"ملقتش نتائج لـ: {q}"
+        return f"ملقتش نتائج لـ: {query}"
 
     movie = movies[0]
-    movie_id = movie.get("id") or movie.get("movieId")
+    movie_id = pick_first_id(movie, ["id", "movieId", "tmdbId"])
+    title = movie.get("title") or movie.get("name") or str(movie_id)
 
-    # مثال: Get subtitles
-    subs = subsource_request("GET", "/api/subtitles", params={"movieId": movie_id, "language": lang})
+    if not movie_id:
+        return f"لقيت نتيجة بس مش قادر أقرأ movie id.\nRaw: {movie}"
+
+    # 2) List subtitles
+    subs_resp = subsource_request("GET", SUBTITLES_LIST_PATH, params={"movieId": movie_id, "language": lang})
+    subs = ensure_list(subs_resp)
     if not subs:
-        return f"لقيت الفيلم بس ملقتش ترجمات ({lang})."
+        return f"لقيت: {title}\nبس ملقتش ترجمات للغة ({lang})."
 
-    # رجّع أحسن 5
-    lines = [f"نتائج لـ: {movie.get('title','(بدون عنوان)')}"]
+    lines = [f"🎬 {title}", f"🌐 Language: {lang}", ""]
     for i, s in enumerate(subs[:5], start=1):
-        sid = s.get("id") or s.get("subtitleId")
-        name = s.get("releaseName") or s.get("name") or "Subtitle"
-        # مثال: Download link endpoint (عدّله حسب الدوكس)
-        lines.append(f"{i}) {name} | id={sid}")
+        sid = pick_first_id(s, ["id", "subtitleId"])
+        name = s.get("releaseName") or s.get("name") or s.get("title") or "Subtitle"
+        rating = s.get("rating") or s.get("score")
+        extra = []
+        if rating is not None:
+            extra.append(f"rating={rating}")
+        if sid is None:
+            lines.append(f"{i}) {name}")
+        else:
+            lines.append(f"{i}) {name}  (id: {sid})" + (f"  [{' ,'.join(extra)}]" if extra else ""))
 
+    lines.append("")
+    lines.append("لو عايز تحميل مباشر: اكتب /sub <name> <lang> --download (لو الـ API بيدعم download endpoint).")
     return "\n".join(lines)
 
 @app.post("/webhook")
 def webhook():
     update = request.get_json(force=True, silent=True) or {}
-    msg = update.get("message") or {}
+    msg = update.get("message") or update.get("edited_message") or {}
     chat_id = (msg.get("chat") or {}).get("id")
     text = (msg.get("text") or "").strip()
 
     if not chat_id:
         return "ok"
 
-    if not text.startswith("/sub"):
-        tg_send(chat_id, "اكتب:\n/sub اسم الفيلم او المسلسل اللغة\nمثال:\n/sub The Bear ar")
+    cmd = parse_sub_command(text)
+    if cmd is None:
+        tg_send(chat_id, "اكتب:\n/sub اسم الفيلم او المسلسل اللغة\nمثال:\n/sub Tenet ar\n/sub The Bear english")
         return "ok"
 
-    parts = text.split(maxsplit=2)
-    if len(parts) < 2:
-        tg_send(chat_id, "اكتب اسم العمل بعد /sub")
+    if not cmd["query"]:
+        tg_send(chat_id, "اكتب اسم العمل بعد /sub\nمثال: /sub Tenet ar")
         return "ok"
-
-    q = parts[1] if len(parts) == 2 else parts[1] + " " + parts[2]
-    # لو آخر كلمة لغة (ar/en/arabic/english...)
-    tokens = q.split()
-    lang = "arabic"
-    if tokens and tokens[-1].lower() in ["ar","en","arabic","english","fr","es","de","it","tr","fa","french","spanish","german","italian","turkish","persian"]:
-        lang = pick_lang_token(tokens[-1])
-        q = " ".join(tokens[:-1]).strip()
 
     try:
-        reply = handle_query(q, lang)
+        reply = handle_search(cmd["query"], cmd["lang"])
     except requests.HTTPError as e:
-        reply = f"حصل خطأ من SubSource API: {str(e)}"
+        # خلي الرسالة مفيدة وفيها URL اللي اتضربت (موجودة في اللوجز)
+        reply = f"حصل خطأ من SubSource API: {str(e)}\n" \
+                f"راجع Heroku Logs وشوف هل الـ BASE/PATH/Auth صح."
+    except Exception as e:
+        reply = f"خطأ غير متوقع: {e}"
 
     tg_send(chat_id, reply)
     return "ok"
@@ -122,3 +188,6 @@ def webhook():
 @app.get("/")
 def home():
     return "OK"
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")))
